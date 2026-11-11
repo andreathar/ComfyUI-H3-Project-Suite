@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **H3 Stage Save / H3 Stage Load.** Save an encode's conditioning and
+  latent, including the `minimax_refs` that core SaveConditioning
+  rejects, as a safetensors file under the output folder. A sampling
+  run that loads the stage never contains the text encoder, so batches
+  can encode every shot first and then sample every shot. The loaded
+  stage samples bit-identically to the single-prompt run.
+  `tests/stage_probe.py` checks the round trip.
+
 ## 1.5.1
 
 - The project panel works inside SwarmUI. Its proxy drops the header

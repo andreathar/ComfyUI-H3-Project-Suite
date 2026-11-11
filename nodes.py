@@ -29,6 +29,7 @@ anchor_mode
           what this mode is asking.
 """
 
+import json
 import logging
 import os
 
@@ -41,6 +42,10 @@ try:
     from safetensors.torch import load_file as _st_load, save_file as _st_save
 except ImportError:  # ComfyUI always ships safetensors; belt and braces
     _st_load = _st_save = None
+try:
+    from safetensors import safe_open
+except ImportError:
+    safe_open = None
 
 from .patch_layout import (
     MC_KEY,
@@ -1423,12 +1428,153 @@ class H3ContextLoadLatent:
         return ({"samples": [data["video"], data["audio"]]},)
 
 
+STAGE_FORMAT = "h3_stage_v1"
+
+
+def _stage_path(name):
+    return os.path.join(folder_paths.get_output_directory(),
+                        _contain_prefix(name) + ".safetensors")
+
+
+def _pack_stage(obj, tensors):
+    """JSON outline of a conditioning/latent tree; tensors go to the
+    safetensors payload by index.
+
+    H3 conditioning carries nested dicts (minimax_refs) that core
+    SaveConditioning rejects. Anything this cannot round-trip exactly is
+    refused, so a stage never loads back subtly different from what the
+    encoder produced.
+    """
+    import comfy.nested_tensor
+    if isinstance(obj, torch.Tensor):
+        key = str(len(tensors))
+        tensors[key] = obj.detach().cpu().contiguous().clone()
+        return {"__tensor__": key}
+    if isinstance(obj, comfy.nested_tensor.NestedTensor):
+        return {"__nested__": [_pack_stage(t, tensors) for t in obj.unbind()]}
+    if isinstance(obj, dict):
+        for k in obj:
+            if not isinstance(k, str) or k.startswith("__"):
+                raise TypeError("h3_suite: cannot stage dict key %r" % (k,))
+        return {k: _pack_stage(v, tensors) for k, v in obj.items()}
+    if isinstance(obj, tuple):
+        return {"__tuple__": [_pack_stage(v, tensors) for v in obj]}
+    if isinstance(obj, list):
+        return [_pack_stage(v, tensors) for v in obj]
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    raise TypeError("h3_suite: cannot stage a %s value" % type(obj).__name__)
+
+
+def _unpack_stage(obj, tensors):
+    import comfy.nested_tensor
+    if isinstance(obj, list):
+        return [_unpack_stage(v, tensors) for v in obj]
+    if not isinstance(obj, dict):
+        return obj
+    if "__tensor__" in obj:
+        return tensors[obj["__tensor__"]]
+    if "__nested__" in obj:
+        return comfy.nested_tensor.NestedTensor(
+            [_unpack_stage(v, tensors) for v in obj["__nested__"]])
+    if "__tuple__" in obj:
+        return tuple(_unpack_stage(v, tensors) for v in obj["__tuple__"])
+    return {k: _unpack_stage(v, tensors) for k, v in obj.items()}
+
+
+class H3StageSave:
+    """Save an H3 encode (conditioning + latent) for a later sampling run.
+
+    A sampling prompt that loads the stage instead of encoding never
+    contains the text encoder, so ComfyUI does not keep its ~15 GB alive
+    next to the diffusion model. Encode every shot first, then sample
+    every shot. The name is the slot: saving the same name again
+    replaces that stage.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "conditioning": ("CONDITIONING",),
+                "latent": ("LATENT",),
+                "name": ("STRING", {
+                    "default": "h3_stages/shot",
+                    "tooltip": "Saved as <name>.safetensors under the "
+                               "ComfyUI output folder. Use one name per "
+                               "shot and attempt."}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("stage_path",)
+    FUNCTION = "save"
+    OUTPUT_NODE = True
+    CATEGORY = "conditioning/minimax"
+    DESCRIPTION = ("Save an H3 encode so a sampling-only run can load it "
+                   "without the text encoder.")
+
+    def save(self, conditioning, latent, name):
+        path = _stage_path(name)
+        tensors = {}
+        outline = {"conditioning": _pack_stage(conditioning, tensors),
+                   "latent": _pack_stage(latent, tensors)}
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        _st_save(tensors, path, metadata={"format": STAGE_FORMAT,
+                                          "outline": json.dumps(outline)})
+        _LOG.info("h3_suite: saved stage %s (%d tensors)", path, len(tensors))
+        return (path,)
+
+
+class H3StageLoad:
+    """Load a stage saved by H3 Stage Save: the encoder's conditioning and
+    latent, ready for the guider and sampler."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "name": ("STRING", {
+                    "default": "h3_stages/shot",
+                    "tooltip": "The name given to H3 Stage Save."}),
+            },
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "LATENT")
+    RETURN_NAMES = ("conditioning", "latent")
+    FUNCTION = "load"
+    CATEGORY = "conditioning/minimax"
+    DESCRIPTION = "Load an H3 encode saved by H3 Stage Save."
+
+    @classmethod
+    def IS_CHANGED(cls, name):
+        try:
+            path = _stage_path(name)
+            return "%s:%d" % (path, os.stat(path).st_mtime_ns)
+        except (OSError, ValueError):
+            return float("NaN")
+
+    def load(self, name):
+        path = _stage_path(name)
+        with safe_open(path, "pt") as fh:
+            meta = fh.metadata() or {}
+            if meta.get("format") != STAGE_FORMAT:
+                raise ValueError("h3_suite: %s is not an H3 stage file" % path)
+            tensors = {k: fh.get_tensor(k) for k in fh.keys()}
+        outline = json.loads(meta["outline"])
+        _LOG.info("h3_suite: loaded stage %s", path)
+        return (_unpack_stage(outline["conditioning"], tensors),
+                _unpack_stage(outline["latent"], tensors))
+
+
 NODE_CLASS_MAPPINGS = {
     "H3Context": H3Context,
     "H3ContextTrim": H3ContextTrim,
     "H3ImportSource": H3ImportSource,
     "H3ContextSaveLatent": H3ContextSaveLatent,
     "H3ContextLoadLatent": H3ContextLoadLatent,
+    "H3StageSave": H3StageSave,
+    "H3StageLoad": H3StageLoad,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "H3Context": "H3 Context",
@@ -1436,4 +1582,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3ImportSource": "H3 Import Source",
     "H3ContextSaveLatent": "H3 Context Save Latent",
     "H3ContextLoadLatent": "H3 Context Load Latent",
+    "H3StageSave": "H3 Stage Save",
+    "H3StageLoad": "H3 Stage Load",
 }
