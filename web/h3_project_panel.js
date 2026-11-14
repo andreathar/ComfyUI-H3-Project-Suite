@@ -998,6 +998,29 @@ function widgetValue(node, name, positional) {
   return Array.isArray(vals) ? vals[positional] : undefined;
 }
 
+/** Project name the Hub will execute with: follow a linked STRING widget
+ *  (Common Variables bus) when present, else the Hub's own widget. */
+function resolvedProjectName(node) {
+  try {
+    const graph = node?.graph || app?.graph;
+    if (graph && node?.inputs) {
+      const idx = node.inputs.findIndex((i) => i && i.name === "project_name");
+      if (idx >= 0) {
+        let src = upstreamNode(graph, node, idx);
+        for (let hop = 0; src && hop < 8; hop++) {
+          const linked = widgetValue(src, "value", 0);
+          if (typeof linked === "string" && linked.trim()) return linked.trim();
+          const named = widgetValue(src, "project_name", 0);
+          if (typeof named === "string" && named.trim()) return named.trim();
+          src = upstreamNode(graph, src, 0);
+        }
+      }
+    }
+  } catch (_) { /* fall through to widget */ }
+  const local = node?.widgets?.find((w) => w.name === "project_name")?.value;
+  return (typeof local === "string" && local.trim()) ? local.trim() : "";
+}
+
 /** The Resolution Selector feeding this node's width input, if there is
  *  one, with what it currently produces. */
 function upstreamSelector(node) {
@@ -1871,8 +1894,7 @@ class ProjectModal extends ChainTimeline {
   }
 
   name() {
-    return this.node.widgets?.find((w) => w.name === "project_name")
-      ?.value || "";
+    return resolvedProjectName(this.node);
   }
 
   clipURL(basename) {
@@ -1880,10 +1902,30 @@ class ProjectModal extends ChainTimeline {
   }
 
   setName(v) {
+    const graph = this.node?.graph || app?.graph;
+    const idx = this.node?.inputs?.findIndex((i) => i && i.name === "project_name");
+    let wroteUpstream = false;
+    if (graph && idx >= 0) {
+      let src = upstreamNode(graph, this.node, idx);
+      for (let hop = 0; src && hop < 8; hop++) {
+        const w = src.widgets?.find((w2) => w2.name === "value" || w2.name === "project_name");
+        if (w) {
+          if (w.value !== v) {
+            w.value = v;
+            src.setDirtyCanvas?.(true, true);
+          }
+          wroteUpstream = true;
+          break;
+        }
+        src = upstreamNode(graph, src, 0);
+      }
+    }
     const w = this.node.widgets?.find((w2) => w2.name === "project_name");
     if (w && w.value !== v) {
       w.value = v;
       this.node.setDirtyCanvas(true, true);
+    } else if (!wroteUpstream && !w) {
+      /* nothing to write */
     }
   }
 
@@ -2987,8 +3029,7 @@ app.registerExtension({
       // turning the Resolution Selector's dial updates the warning
       // without another round trip
       this._h3PaintSummary = () => {
-        const name = this.widgets?.find(
-          (w) => w.name === "project_name")?.value;
+        const name = resolvedProjectName(this);
         const s = this._h3State;
         if (!name) return;
         if (!s || s._name !== name) {
@@ -3020,8 +3061,7 @@ app.registerExtension({
       };
 
       this._h3RefreshSummary = async () => {
-        const name = this.widgets?.find(
-          (w) => w.name === "project_name")?.value;
+        const name = resolvedProjectName(this);
         if (!name) return;
         try {
           const s = await getState(name);

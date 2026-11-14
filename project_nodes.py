@@ -16,6 +16,7 @@ re-roll / reject live on the manifest via the HTTP routes; the next queue
 press re-resolves because IS_CHANGED hashes the manifest.
 """
 
+import ast
 import datetime
 import json
 import logging
@@ -70,6 +71,136 @@ def _placeholder_latent():
         raise RuntimeError("h3_suite: torch unavailable")
     return {"samples": [torch.zeros((1, 24, 2, 4, 4)),
                         torch.zeros((1, 32, 2, 4))]}
+
+
+def _prompt_node(prompt, node_id):
+    if not isinstance(prompt, dict):
+        return {}
+    node = prompt.get(str(node_id))
+    if node is None:
+        node = prompt.get(node_id)
+    return node if isinstance(node, dict) else {}
+
+
+def _linked_literal(prompt, value, depth=0):
+    """Resolve a prompt input that may be a literal or [node_id, slot] link."""
+    if depth > 4:
+        return None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, (int, float, bool)):
+        return value
+    if not (isinstance(value, list) and len(value) == 2):
+        return None
+    src = _prompt_node(prompt, value[0])
+    inputs = src.get("inputs") or {}
+    class_type = src.get("class_type")
+    if class_type in ("PrimitiveString", "PrimitiveInt", "PrimitiveFloat",
+                      "PrimitiveBoolean"):
+        return _linked_literal(prompt, inputs.get("value"), depth + 1)
+    if class_type == "FantasticSeeds" and "seed" in inputs:
+        return _linked_literal(prompt, inputs.get("seed"), depth + 1)
+    for key in ("value", "seed", "filename", "transition"):
+        if key in inputs:
+            return _linked_literal(prompt, inputs.get(key), depth + 1)
+    return None
+
+
+def _packages_from_prompt(prompt):
+    """Recover embedded shot packages from a DynamicScript resolver body."""
+    if not isinstance(prompt, dict):
+        return {}
+    for node in prompt.values():
+        if not isinstance(node, dict) or node.get("class_type") != "DynamicScriptNode":
+            continue
+        code = (node.get("inputs") or {}).get("code")
+        if not isinstance(code, str) or "PACKAGES = _json.loads(" not in code:
+            continue
+        marker = "PACKAGES = _json.loads("
+        start = code.find(marker)
+        if start < 0:
+            continue
+        start = code.find("(", start) + 1
+        if start <= 0 or start >= len(code):
+            continue
+        # loads(...) argument is a single-quoted Python string of JSON.
+        if code[start] not in "'\"":
+            continue
+        quote = code[start]
+        end = start + 1
+        while end < len(code):
+            if code[end] == "\\" and end + 1 < len(code):
+                end += 2
+                continue
+            if code[end] == quote:
+                break
+            end += 1
+        else:
+            continue
+        try:
+            raw = ast.literal_eval(code[start:end + 1])
+            packages = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, ValueError, SyntaxError, json.JSONDecodeError):
+            continue
+        if isinstance(packages, dict):
+            return packages
+    return {}
+
+
+def _scene_fields_from_prompt(prompt, unique_id=None):
+    """Pull shot tag, transition, and seed from the executed API prompt."""
+    shot_id = ""
+    transition = ""
+    seed = ""
+    if not isinstance(prompt, dict):
+        return shot_id, transition, seed
+
+    if unique_id is not None:
+        branch = {}
+        pending = [str(unique_id)]
+        while pending:
+            node_id = pending.pop()
+            if node_id in branch:
+                continue
+            node = _prompt_node(prompt, node_id)
+            branch[node_id] = node
+            for value in (node.get("inputs") or {}).values():
+                if isinstance(value, list) and len(value) == 2 and isinstance(value[0], (str, int)):
+                    pending.append(str(value[0]))
+        prompt = branch
+
+    for node in prompt.values():
+        if not isinstance(node, dict):
+            continue
+        class_type = node.get("class_type")
+        inputs = node.get("inputs") or {}
+        if class_type == "MiniMaxH3FilenamePrefix":
+            resolved = _linked_literal(prompt, inputs.get("filename"))
+            if isinstance(resolved, str) and resolved.strip().startswith("MSG_"):
+                shot_id = resolved.strip()
+        if class_type == "PrimitiveString":
+            value = inputs.get("value")
+            if isinstance(value, str) and value.startswith("MSG_"):
+                shot_id = shot_id or value.strip()
+        if class_type == "FantasticSeeds" and seed == "":
+            resolved = _linked_literal(prompt, inputs.get("seed"))
+            if isinstance(resolved, (int, float)):
+                seed = str(int(resolved))
+            elif isinstance(resolved, str) and resolved.strip().lstrip("-").isdigit():
+                seed = str(int(resolved.strip()))
+
+    packages = _packages_from_prompt(prompt)
+    pkg = packages.get(shot_id) if shot_id else None
+    if isinstance(pkg, dict):
+        tr = str(pkg.get("transition") or "").strip().lower()
+        if tr in ("cut", "continue"):
+            transition = tr
+        if pkg.get("seed") is not None:
+            try:
+                seed = str(int(pkg["seed"]))
+            except (TypeError, ValueError, OverflowError):
+                pass  # Optional display metadata must not fail an already committed save.
+    return shot_id, transition, seed
 
 
 class H3ProjectHub:
@@ -376,6 +507,7 @@ class H3ProjectSave:
             # ComfyUI hands these over for free; they are what makes a clip
             # reusable later instead of just watchable
             "hidden": {"prompt": "PROMPT",
+                       "unique_id": "UNIQUE_ID",
                        "extra_pnginfo": "EXTRA_PNGINFO"},
         }
 
@@ -391,7 +523,7 @@ class H3ProjectSave:
                    "type, nothing to advance.")
 
     def save(self, project, latent, images, fps, audio=None, prompt=None,
-             extra_pnginfo=None):
+             extra_pnginfo=None, unique_id=None):
         if _st_save is None:
             raise RuntimeError("h3_suite: safetensors unavailable")
         p = Project(project["output_dir"], project["name"])
@@ -514,7 +646,20 @@ class H3ProjectSave:
         else:
             _LOG.info("h3_suite: project %r recorded %s (pending review)",
                       p.name, basename)
-        return (basename,)
+        shot_id, transition, seed = _scene_fields_from_prompt(prompt, unique_id)
+        active_scene = {
+            "run_name": str(p.name),
+            "clip_index": int(index),
+            "clip_count": int(index) + 1,
+            "end_clip": int(index) + 1,
+            "shot_id": shot_id or basename,
+            "take": int(take),
+            "transition": transition,
+            "seed": seed,
+            "workflow_fingerprint": "",
+        }
+        return {"ui": {"h3_chain_active_scene": [active_scene]},
+                "result": (basename,)}
 
 
 NODE_CLASS_MAPPINGS = {
